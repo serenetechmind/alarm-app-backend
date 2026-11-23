@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alarm API · Developer dashboard</title>
+<style>
+:root{--bg:#0B0F1A;--card:#141A2B;--high:#1F2742;--line:#262E4A;--amber:#FFB547;--on-amber:#1C1200;--text:#F2F4FA;--dim:#9BA6C4;--ok:#5AD19A;--err:#FF6B6B}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+header h1{font-size:18px;font-weight:500;margin:0;flex:1}
+header h1 span{color:var(--dim);font-weight:400}
+main{max-width:760px;margin:0 auto;padding:16px;display:grid;gap:14px}
+.card{background:var(--card);border-radius:20px;padding:18px}
+.card h2{margin:0 0 4px;font-size:16px;font-weight:500}
+.sub{color:var(--dim);font-size:13px;margin:0 0 10px}
+.locked{opacity:.4;pointer-events:none}
+label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+input,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:inherit}
+input:focus,select:focus{outline:none;border-color:var(--amber)}
+button{font:inherit;cursor:pointer;border:0;border-radius:999px;padding:10px 16px;background:var(--high);color:var(--text)}
+button.primary{background:var(--amber);color:var(--on-amber);font-weight:600}
+button.small{padding:6px 12px;font-size:13px}
+button.danger{color:var(--err)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grow{flex:1 1 160px}
+.keybox{background:var(--bg);border:1px dashed var(--amber);border-radius:12px;padding:10px 12px;word-break:break-all;font-family:ui-monospace,Consolas,monospace;font-size:13px;margin:8px 0}
+.chip{display:inline-block;background:var(--high);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--dim);text-decoration:none}
+.chip.ok{color:var(--ok)}
+.days{display:flex;gap:6px;margin:6px 0 4px}
+.days button{width:36px;height:36px;padding:0;border-radius:50%;background:var(--bg);color:var(--dim)}
+.days button.on{background:var(--amber);color:var(--on-amber);font-weight:600}
+.item{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
+.item .t{font-size:22px;font-weight:300;min-width:64px}
+.item .m{flex:1;min-width:0;color:var(--dim);font-size:13px;word-break:break-word}
+.item .m b{color:var(--text);font-weight:500}
+.ev{border-top:1px solid var(--line);padding:8px 0;font-size:13px}
+.ev b{color:var(--amber);font-weight:500}
+.ev span{color:var(--dim)}
+code,pre{font-family:ui-monospace,Consolas,monospace}
+pre{background:var(--bg);border-radius:12px;padding:12px;overflow:auto;font-size:12px;margin:6px 0 12px;white-space:pre-wrap;word-break:break-word}
+.qr{background:#fff;border-radius:16px;padding:8px;width:190px;height:190px}
+.err{color:var(--err)} .ok{color:var(--ok)}
+details{margin-top:14px;color:var(--dim);font-size:13px}
+summary{cursor:pointer}
+a{color:var(--amber)}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--high);padding:10px 18px;border-radius:999px;opacity:0;transition:.2s;pointer-events:none;z-index:9;max-width:90vw}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <svg width="34" height="34" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="30" fill="#141A2B"/><circle cx="34" cy="36" r="8" fill="#FFB547"/><circle cx="74" cy="36" r="8" fill="#FFB547"/><circle cx="54" cy="56" r="22" fill="none" stroke="#FFB547" stroke-width="5"/><path d="M54,43 L54,56 L63,62" fill="none" stroke="#FFB547" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <h1>Alarm API <span>developer dashboard</span></h1>
+  <span class="chip" id="chip">Not signed in</span>
+</header>
+
+<main>
+  <section class="card" id="s-account">
+    <h2>1 · Your API key</h2>
+    <div id="account-body"></div>
+  </section>
+
+  <section class="card needs-key" id="s-connect">
+    <h2>2 · Connect a phone</h2>
+    <p class="sub">Like "Connect with Google Calendar": the user taps Allow inside AlarmApp. No codes to copy.</p>
+    <label for="redirect-url">After approval, send the user back to (optional)</label>
+    <input id="redirect-url" placeholder="https://yourapp.com/alarms/connected">
+    <div class="row" style="margin-top:12px"><button class="primary" id="btn-connect">Create connect link</button></div>
+    <div id="connect-result" style="margin-top:14px"></div>
+    <details>
+      <summary>No Connect button? Use the phone's pair code instead</summary>
+      <div class="row" style="margin-top:8px"><input id="pair-code" class="grow" placeholder="6-digit code from the app"><button id="btn-pair">Connect</button></div>
+    </details>
+  </section>
+
+  <section class="card needs-key" id="s-alarms">
+    <h2>3 · Alarms</h2>
+    <p class="sub">Alarm times use the phone's own clock and timezone.</p>
+    <label for="conn-select">Phone</label>
+    <select id="conn-select"><option value="">No phones connected yet</option></select>
+    <div class="row" style="margin-top:12px"><button class="primary" id="btn-quick">Ring in 2 minutes</button><span class="sub" style="margin:0">One-tap test alarm</span></div>
+    <label for="alarm-time">Or set one yourself</label>
+    <div class="row">
+      <input id="alarm-time" type="time" class="grow">
+      <input id="alarm-label" class="grow" placeholder="Label (optional)" maxlength="80">
+      <select id="snooze" style="width:auto"><option value="5">Snooze 5 min</option><option value="10" selected>Snooze 10 min</option><option value="15">Snooze 15 min</option></select>
+    </div>
+    <label>Repeat (leave empty for a one-time alarm)</label>
+    <div class="days" id="days"></div>
+    <div class="row" style="margin-top:10px"><button id="btn-create-alarm">Create alarm</button></div>
+    <div id="alarm-list" style="margin-top:14px"></div>
+  </section>
+
+  <section class="card needs-key" id="s-hooks">
+    <h2>4 · Webhooks (optional)</h2>
+    <p class="sub">Get an HTTPS call when an alarm rings, is snoozed or dismissed. Tip: paste a free address from webhook.site to watch them arrive.</p>
+    <div class="row"><input id="hook-url" class="grow" placeholder="https://webhook.site/your-id"><button id="btn-hook">Add webhook</button></div>
+    <div id="hook-secret"></div>
+    <div id="hook-list" style="margin-top:10px"></div>
+  </section>
+
+  <section class="card needs-key" id="s-activity">
+    <h2>Activity</h2>
+    <p class="sub">Everything that happens on your connections, live. No webhook needed.</p>
+    <div id="events"></div>
+  </section>
+
+  <section class="card" id="s-code">
+    <h2>The code behind your last action</h2>
+    <p class="sub" id="code-summary">Do something above and the matching code appears here, ready to copy into your app.</p>
+    <div class="row"><span class="sub" style="margin:0">curl</span><button class="small" data-copy="code-curl">Copy</button></div>
+    <pre id="code-curl"></pre>
+    <div class="row"><span class="sub" style="margin:0">JavaScript</span><button class="small" data-copy="code-js">Copy</button></div>
+    <pre id="code-js"></pre>
+    <span class="sub">Response</span>
+    <pre id="code-res"></pre>
+    <p class="sub">Keep your API key on your server, not in public web pages.</p>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const BASE = location.origin;
+const DAYS = ['S','M','T','W','T','F','S'];
+let KEY = localStorage.getItem('alarm_api_key') || '';
+let ACTIVE = Number(localStorage.getItem('alarm_active_conn') || 0) || 0;
+let ME = null, connectTimer = null, lastCall = null;
+const days = new Set();
+
+function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2600); }
+function copy(text){ navigator.clipboard.writeText(text).then(() => toast('Copied'), () => toast('Copy failed')); }
+function ago(ts){ const s = Math.max(0, Math.round((Date.now() - ts) / 1000)); if (s < 60) return s + 's ago'; if (s < 3600) return Math.floor(s / 60) + 'm ago'; return Math.floor(s / 3600) + 'h ago'; }
+function inMinutes(n){ const d = new Date(Date.now() + n * 60000); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function fmtDays(d){ return d.length ? DAYS.map((l, i) => d.includes(i + 1) ? l : '·').join(' ') : 'Once'; }
+
+async function api(method, path, body, opts = {}){
+  const headers = {'Content-Type': 'application/json'};
+  if (opts.auth !== false) headers['Authorization'] = 'Bearer ' + KEY;
+  let res;
+  try { res = await fetch(BASE + path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body)}); }
+  catch (e) { throw new Error('Cannot reach the server. If it was asleep, wait a minute and try again.'); }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+  if (!opts.quiet) { lastCall = {method, path, body, auth: opts.auth !== false, status: res.status, data}; renderCode(); }
+  if (!res.ok) {
+    const d = data && data.detail ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : (text || res.status);
+    throw new Error(res.status + ': ' + d);
+  }
+  return data;
+}
+
+function renderCode(){
+  if (!lastCall) return;
+  const c = lastCall, url = BASE + c.path, hasBody = c.body !== undefined;
+  const curl = `curl -X ${c.method} '${url}' \\\n` +
+    (c.auth ? `  -H 'Authorization: Bearer YOUR_API_KEY' \\\n` : '') +
+    `  -H 'Content-Type: application/json'` +
+    (hasBody ? ` \\\n  -d '${JSON.stringify(c.body, null, 2)}'` : '');
+  const js = `const res = await fetch('${url}', {\n  method: '${c.method}',\n  headers: {\n` +
+    (c.auth ? `    'Authorization': 'Bearer YOUR_API_KEY',\n` : '') +
+    `    'Content-Type': 'application/json'\n  }` +
+    (hasBody ? `,\n  body: JSON.stringify(${JSON.stringify(c.body, null, 2).replace(/\n/g, '\n  ')})` : '') +
+    `\n});\n` + (c.status === 204 ? '' : 'const data = await res.json();');
+  $('#code-summary').textContent = `${c.method} ${c.path} → ${c.status}`;
+  $('#code-curl').textContent = curl;
+  $('#code-js').textContent = js;
+  $('#code-res').textContent = typeof c.data === 'string' ? c.data : JSON.stringify(c.data, null, 2);
+}
+
+/* ---------- account ---------- */
+function renderAccount(){
+  const el = $('#account-body'), chip = $('#chip');
+  if (!KEY) {
+    chip.textContent = 'Not signed in'; chip.className = 'chip';
+    el.innerHTML = `<p class="sub">Create a key for your app, or paste one you already have.</p>
+      <label for="app-name">App name</label>
+      <div class="row"><input id="app-name" class="grow" placeholder="e.g. My Todo App"><button class="primary" id="btn-create-dev">Create API key</button></div>
+      <label for="paste-key">…or paste an existing key</label>
+      <div class="row"><input id="paste-key" class="grow" placeholder="ak_…"><button id="btn-use-key">Use key</button></div>`;
+    $('#btn-create-dev').onclick = createDeveloper;
+    $('#btn-use-key').onclick = useKey;
+  } else {
+    chip.textContent = ME ? ME.app_name : 'Checking…'; chip.className = 'chip ok';
+    el.innerHTML = `<p class="sub">Signed in as <b>${esc(ME ? ME.app_name : '…')}</b> (${esc(ME ? ME.key_prefix : KEY.slice(0, 8))}…). The key is saved in this browser only.</p>
+      <div id="newkey"></div><div class="row"><button class="small" id="btn-signout">Sign out</button></div>`;
+    $('#btn-signout').onclick = signOut;
+  }
+  document.querySelectorAll('.needs-key').forEach(e => e.classList.toggle('locked', !KEY));
+}
+
+async function createDeveloper(){
+  const name = $('#app-name').value.trim();
+  if (name.length < 2) return toast('Enter an app name');
+  try {
+    const d = await api('POST', '/v1/developers', {app_name: name}, {auth: false});
+    KEY = d.api_key; localStorage.setItem('alarm_api_key', KEY);
+    await boot();
+    $('#newkey').innerHTML = `<div class="keybox">${esc(d.api_key)}</div><div class="row"><button class="small primary" id="btn-copy-key">Copy key</button><span class="sub" style="margin:0">Shown once. Save it somewhere safe.</span></div>`;
+    $('#btn-copy-key').onclick = () => copy(d.api_key);
+  } catch (e) { toast(e.message); }
+}
+async function useKey(){
+  const k = $('#paste-key').value.trim();
+  if (!k) return;
+  KEY = k; localStorage.setItem('alarm_api_key', KEY);
+  await boot();
+}
+function signOut(){
+  KEY = ''; ME = null; ACTIVE = 0;
+  localStorage.removeItem('alarm_api_key'); localStorage.removeItem('alarm_active_conn');
+  $('#connect-result').innerHTML = ''; $('#alarm-list').innerHTML = ''; $('#hook-list').innerHTML = ''; $('#events').innerHTML = '';
+  renderAccount();
+}
+
+/* ---------- connect ---------- */
+async function createConnectLink(){
+  const redirect = $('#redirect-url').value.trim();
+  try {
+    const r = await api('POST', '/v1/connect/requests', redirect ? {redirect_url: redirect, state: 'dashboard-test'} : {});
+    $('#connect-result').innerHTML = `<div class="row" style="align-items:flex-start">
+      <img class="qr" src="${esc(r.qr_url)}" alt="QR code">
+      <div class="grow"><p class="sub">Open this link on the phone that has AlarmApp, or scan the QR code with its camera. It works for 15 minutes.</p>
+      <div class="keybox">${esc(r.connect_url)}</div>
+      <div class="row"><button class="small" id="btn-copy-link">Copy link</button><a class="chip" href="${esc(r.connect_url)}" target="_blank" rel="noopener">Open here</a></div>
+      <p id="connect-status" class="sub" style="margin-top:10px">Waiting for the user to tap Allow…</p></div></div>`;
+    $('#btn-copy-link').onclick = () => copy(r.connect_url);
+    pollConnect(r.request_id);
+  } catch (e) { toast(e.message); }
+}
+function pollConnect(rid){
+  clearTimeout(connectTimer);
+  const tick = async () => {
+    try {
+      const s = await api('GET', '/v1/connect/requests/' + rid, undefined, {quiet: true});
+      const el = $('#connect-status');
+      if (!el) return;
+      if (s.status === 'approved') {
+        el.innerHTML = '<span class="ok">Connected ✓</span> connection #' + s.connection_id;
+        ACTIVE = s.connection_id; localStorage.setItem('alarm_active_conn', ACTIVE);
+        await loadConnections(); await loadAlarms();
+        return;
+      }
+      if (s.status === 'denied' || s.status === 'expired') {
+        el.innerHTML = '<span class="err">' + (s.status === 'denied' ? 'The user said no.' : 'This link expired.') + '</span> Create a new one.';
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+    connectTimer = setTimeout(tick, 2000);
+  };
+  tick();
+}
+async function usePairCode(){
+  const code = $('#pair-code').value.trim();
+  if (!code) return;
+  try {
+    const r = await api('POST', '/v1/connections', {pair_code: code});
+    ACTIVE = r.connection_id; localStorage.setItem('alarm_active_conn', ACTIVE);
+    toast('Connected'); await loadConnections(); await loadAlarms();
+  } catch (e) { toast(e.message); }
+}
+async function loadConnections(){
+  let list = [];
+  try { list = await api('GET', '/v1/connections', undefined, {quiet: true}); } catch (e) { /* ignore */ }
+  const sel = $('#conn-select');
+  if (!list.length) { sel.innerHTML = '<option value="">No phones connected yet</option>'; ACTIVE = 0; }
+  else {
+    if (!list.some(c => c.connection_id === ACTIVE)) ACTIVE = list[0].connection_id;
+    sel.innerHTML = list.map(c => `<option value="${c.connection_id}" ${c.connection_id === ACTIVE ? 'selected' : ''}>Phone connection #${c.connection_id}</option>`).join('');
+  }
+  localStorage.setItem('alarm_active_conn', ACTIVE);
+  $('#s-alarms').classList.toggle('locked', !KEY || !ACTIVE);
+}
+
+/* ---------- alarms ---------- */
+async function loadAlarms(){
+  const el = $('#alarm-list');
+  if (!ACTIVE) { el.innerHTML = ''; return; }
+  try {
+    const list = await api('GET', '/v1/alarms?connection_id=' + ACTIVE, undefined, {quiet: true});
+    el.innerHTML = list.length ? list.map(a => `<div class="item"><div class="t">${esc(a.time)}</div>
+      <div class="m"><b>${esc(a.label || '(no label)')}</b><br>${esc(fmtDays(a.repeat_days))} · snooze ${a.snooze_minutes} min</div>
+      <button class="small" data-toggle="${a.id}" data-on="${a.enabled}">${a.enabled ? 'On' : 'Off'}</button>
+      <button class="small danger" data-del="${a.id}">Delete</button></div>`).join('')
+      : '<p class="sub">No alarms yet. Create one above.</p>';
+    el.querySelectorAll('[data-toggle]').forEach(b => b.onclick = () => toggleAlarm(b.dataset.toggle, b.dataset.on !== 'true'));
+    el.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteAlarm(b.dataset.del));
+  } catch (e) { el.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+async function createAlarm(time, label){
+  try {
+    await api('POST', '/v1/alarms', {connection_id: ACTIVE, time, repeat_days: [...days].sort(), label, snooze_minutes: Number($('#snooze').value)});
+    toast('Alarm sent to the phone'); await loadAlarms();
+  } catch (e) { toast(e.message); }
+}
+async function toggleAlarm(id, on){ try { await api('PATCH', '/v1/alarms/' + id, {enabled: on}); await loadAlarms(); } catch (e) { toast(e.message); } }
+async function deleteAlarm(id){ try { await api('DELETE', '/v1/alarms/' + id); await loadAlarms(); } catch (e) { toast(e.message); } }
+
+/* ---------- webhooks ---------- */
+async function loadHooks(){
+  const el = $('#hook-list');
+  try {
+    const list = await api('GET', '/v1/webhooks', undefined, {quiet: true});
+    el.innerHTML = list.length ? list.map(h => `<div class="item"><div class="m"><b>${esc(h.url)}</b><br>${esc(h.events.join(', '))}</div><button class="small danger" data-hdel="${h.id}">Delete</button></div>`).join('')
+      : '<p class="sub">No webhooks yet. Events still show in Activity below.</p>';
+    el.querySelectorAll('[data-hdel]').forEach(b => b.onclick = () => deleteHook(b.dataset.hdel));
+  } catch (e) { el.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+async function createHook(){
+  const url = $('#hook-url').value.trim();
+  if (!/^https?:\/\//i.test(url)) return toast('Enter a full URL starting with https://');
+  try {
+    const h = await api('POST', '/v1/webhooks', {url});
+    $('#hook-secret').innerHTML = `<p class="sub" style="margin-top:10px">Signing secret (shown once). Use it to verify the X-Alarm-Signature header:</p><div class="keybox">${esc(h.secret)}</div>`;
+    $('#hook-url').value = ''; loadHooks();
+  } catch (e) { toast(e.message); }
+}
+async function deleteHook(id){ try { await api('DELETE', '/v1/webhooks/' + id); loadHooks(); } catch (e) { toast(e.message); } }
+
+/* ---------- activity ---------- */
+async function loadEvents(){
+  if (!KEY) return;
+  try {
+    const list = await api('GET', '/v1/events?limit=30', undefined, {quiet: true});
+    $('#events').innerHTML = list.length
+      ? list.map(e => `<div class="ev"><b>${esc(e.event)}</b> <span>${ago(e.ts)}</span><br><code>${esc(JSON.stringify(e.data))}</code></div>`).join('')
+      : '<p class="sub">Nothing yet. Connection approved, alarm fired, snoozed and dismissed all show up here.</p>';
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------- start ---------- */
+async function boot(){
+  ME = null;
+  if (KEY) {
+    try { ME = await api('GET', '/v1/me', undefined, {quiet: true}); }
+    catch (e) {
+      if (String(e.message).startsWith('401')) {
+        KEY = ''; localStorage.removeItem('alarm_api_key');
+        toast('That key is not valid. If the server was reset, create a new one.');
+      } else toast(e.message);
+    }
+  }
+  renderAccount();
+  if (KEY) { await loadConnections(); await loadHooks(); await loadAlarms(); loadEvents(); }
+}
+
+$('#days').innerHTML = DAYS.map((l, i) => `<button type="button" data-d="${i + 1}">${l}</button>`).join('');
+$('#days').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const d = Number(b.dataset.d);
+  if (days.has(d)) days.delete(d); else days.add(d);
+  b.classList.toggle('on', days.has(d));
+};
+$('#alarm-time').value = inMinutes(5);
+$('#btn-connect').onclick = createConnectLink;
+$('#btn-pair').onclick = usePairCode;
+$('#btn-quick').onclick = () => createAlarm(inMinutes(2), 'Test alarm');
+$('#btn-create-alarm').onclick = () => createAlarm($('#alarm-time').value, $('#alarm-label').value.trim());
+$('#btn-hook').onclick = createHook;
+$('#conn-select').onchange = e => { ACTIVE = Number(e.target.value) || 0; localStorage.setItem('alarm_active_conn', ACTIVE); loadAlarms(); };
+document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => copy($('#' + b.dataset.copy).textContent));
+setInterval(() => { if (KEY) loadEvents(); }, 3000);
+setInterval(() => { if (KEY && ACTIVE) loadAlarms(); }, 6000);
+boot();
+</script>
+</body>
+</html>

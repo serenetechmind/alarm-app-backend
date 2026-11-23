@@ -12,19 +12,25 @@ Ids stay small integers (kept in a counter document) so the Android app and the 
 """
 import hashlib
 import hmac
+import html
+import io
 import json
 import os
 import secrets
 import time
+from pathlib import Path
 from typing import Annotated, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from google.cloud.firestore_v1 import Query
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Alarm API", version="0.2.0")
+app = FastAPI(title="Alarm API", version="0.3.0")
 
 # Authorization uses a header (no cookies), so allowing any origin is safe for browser testing.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -235,7 +241,18 @@ def owned_alarm(dev: dict, alarm_id: int):
     return alarm, conn
 
 
+def log_event(developer_id: int, event: str, data: dict):
+    """Keeps an activity feed per developer so the dashboard can show events without a webhook."""
+    try:
+        fs().collection("developers").document(str(developer_id)).collection("events").add(
+            {"event": event, "data": data, "ts": int(time.time() * 1000)}
+        )
+    except Exception as e:
+        print(f"[event log failed] {e}")
+
+
 def deliver_webhooks(developer_id: int, event: str, data: dict):
+    log_event(developer_id, event, data)
     hooks = [h.to_dict() for h in query("webhooks", developer_id=developer_id).stream()]
     body = json.dumps({"event": event, "data": data, "timestamp": now()})
     for h in hooks:
@@ -445,6 +462,219 @@ def device_event(body: DeviceEventIn, tasks: BackgroundTasks, device=Depends(cur
         {"alarm_id": body.alarm_id, "connection_id": alarm["connection_id"], "label": alarm.get("label", "")},
     )
     return {"status": "accepted"}
+
+
+# ---------- "Connect with AlarmApp" (no codes to copy) ----------
+
+CONNECT_TTL = 15 * 60  # seconds a connect link stays valid
+ANDROID_SCHEME = os.getenv("ANDROID_SCHEME", "alarmapp")
+ANDROID_PACKAGE = os.getenv("ANDROID_PACKAGE", "com.example.alarmapp")
+
+
+class ConnectRequestIn(BaseModel):
+    redirect_url: Optional[str] = Field(None, max_length=500)
+    state: Optional[str] = Field(None, max_length=200)
+
+
+def public_base(request: Request) -> str:
+    env = os.getenv("PUBLIC_BASE_URL")
+    if env:
+        return env.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+def add_query(url: str, params: dict) -> str:
+    parts = urlsplit(url)
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True) + [(k, str(v)) for k, v in params.items()]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query_pairs), parts.fragment))
+
+
+def load_request(rid: str) -> dict:
+    snap = fs().collection("connect_requests").document(rid).get()
+    if not snap.exists:
+        raise HTTPException(404, "Unknown connect link")
+    r = snap.to_dict()
+    if r["status"] == "pending" and r["expires_at"] < now():
+        r["status"] = "expired"
+    return r
+
+
+@app.post("/v1/connect/requests", status_code=201)
+def create_connect_request(body: ConnectRequestIn, request: Request, dev=Depends(current_developer)):
+    """Step 1 for a developer: get a link/QR to show the user. The user approves inside AlarmApp."""
+    if body.redirect_url and not body.redirect_url.lower().startswith(("http://", "https://")):
+        raise HTTPException(422, "redirect_url must start with http:// or https://")
+    rid = secrets.token_urlsafe(16)
+    t = now()
+    fs().collection("connect_requests").document(rid).set(
+        {
+            "developer_id": dev["id"],
+            "status": "pending",
+            "redirect_url": body.redirect_url,
+            "state": body.state,
+            "connection_id": None,
+            "created_at": t,
+            "expires_at": t + CONNECT_TTL,
+        }
+    )
+    base = public_base(request)
+    return {
+        "request_id": rid,
+        "connect_url": f"{base}/c/{rid}",
+        "qr_url": f"{base}/c/{rid}/qr.svg",
+        "expires_in": CONNECT_TTL,
+    }
+
+
+@app.get("/v1/connect/requests/{rid}")
+def get_connect_request(rid: str, dev=Depends(current_developer)):
+    """Poll this (or use the connection.approved webhook) to learn when the user tapped Allow."""
+    r = load_request(rid)
+    if r["developer_id"] != dev["id"]:
+        raise HTTPException(404, "Unknown connect link")
+    return {"request_id": rid, "status": r["status"], "connection_id": r.get("connection_id"), "state": r.get("state")}
+
+
+CONNECT_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect to AlarmApp</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0B0F1A;color:#F2F4FA;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;box-sizing:border-box}
+main{max-width:380px;text-align:center}
+h1{font-size:24px;font-weight:400;margin:18px 0 8px}
+p{color:#9BA6C4;margin:6px 0}
+b{color:#FFB547;font-weight:500}
+.btn{display:inline-block;margin-top:18px;background:#FFB547;color:#1C1200;font-weight:600;text-decoration:none;padding:14px 26px;border-radius:999px}
+.qr{background:#fff;border-radius:16px;padding:8px;width:210px;height:210px;margin-top:14px}
+.ok{color:#5AD19A}.err{color:#FF6B6B}
+</style></head><body><main>
+<svg width="72" height="72" viewBox="0 0 108 108" aria-hidden="true"><rect width="108" height="108" rx="30" fill="#141A2B"/><circle cx="34" cy="36" r="8" fill="#FFB547"/><circle cx="74" cy="36" r="8" fill="#FFB547"/><circle cx="54" cy="56" r="22" fill="none" stroke="#FFB547" stroke-width="5"/><path d="M54,43 L54,56 L63,62" fill="none" stroke="#FFB547" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<h1><b>__APP__</b> wants to set alarms on your phone</h1>
+<p>Approve it in the AlarmApp on your Android phone. You can disconnect it any time.</p>
+<div id="phone"><a class="btn" href="__INTENT__">Open AlarmApp to approve</a><p style="font-size:13px">Nothing opened? Install AlarmApp first, then tap the button again.</p></div>
+<div id="desktop" hidden><img class="qr" src="/c/__RID__/qr.svg" alt="QR code"><p>Scan this with your phone's camera to continue.</p></div>
+<p id="status"></p>
+</main>
+<script>
+const RID = __RID_JSON__, INTENT = __INTENT_JSON__;
+const android = /Android/i.test(navigator.userAgent);
+if (android) { setTimeout(function () { location.href = INTENT; }, 400); }
+else { document.getElementById('phone').hidden = true; document.getElementById('desktop').hidden = false; }
+const statusEl = document.getElementById('status');
+async function poll() {
+  try {
+    const j = await (await fetch('/c/' + RID + '/status')).json();
+    if (j.status === 'approved') {
+      statusEl.innerHTML = '<span class="ok">Connected \u2713</span> You can go back to the app.';
+      if (j.redirect_to) setTimeout(function () { location.href = j.redirect_to; }, 1200);
+      return;
+    }
+    if (j.status === 'denied') { statusEl.innerHTML = '<span class="err">Request declined.</span>'; return; }
+    if (j.status === 'expired' || j.detail) { statusEl.innerHTML = '<span class="err">This link expired.</span> Ask the app for a new one.'; return; }
+  } catch (e) {}
+  setTimeout(poll, 2000);
+}
+poll();
+</script></body></html>"""
+
+
+@app.get("/c/{rid}", response_class=HTMLResponse, include_in_schema=False)
+def connect_page(rid: str):
+    try:
+        r = load_request(rid)
+    except HTTPException:
+        return HTMLResponse("<p style='font:16px system-ui;padding:24px'>This connect link is not valid. Ask the app for a new one.</p>", status_code=404)
+    dev = get_doc("developers", r["developer_id"]) or {}
+    intent = f"intent://connect/{rid}#Intent;scheme={ANDROID_SCHEME};package={ANDROID_PACKAGE};end"
+    page = (
+        CONNECT_PAGE.replace("__APP__", html.escape(dev.get("app_name", "An app")))
+        .replace("__INTENT_JSON__", json.dumps(intent))
+        .replace("__INTENT__", html.escape(intent, quote=True))
+        .replace("__RID_JSON__", json.dumps(rid))
+        .replace("__RID__", rid)
+    )
+    return HTMLResponse(page)
+
+
+@app.get("/c/{rid}/status", include_in_schema=False)
+def connect_status(rid: str):
+    r = load_request(rid)
+    out = {"status": r["status"]}
+    if r["status"] == "approved" and r.get("redirect_url"):
+        params = {"connection_id": r["connection_id"]}
+        if r.get("state"):
+            params["state"] = r["state"]
+        out["redirect_to"] = add_query(r["redirect_url"], params)
+    return out
+
+
+@app.get("/c/{rid}/qr.svg", include_in_schema=False)
+def connect_qr(rid: str, request: Request):
+    load_request(rid)
+    import segno
+
+    buf = io.BytesIO()
+    segno.make(f"{public_base(request)}/c/{rid}", error="m").save(
+        buf, kind="svg", scale=6, border=2, dark="#0B0F1A", light="#FFFFFF"
+    )
+    return Response(buf.getvalue(), media_type="image/svg+xml")
+
+
+@app.get("/v1/device/connect/{rid}")
+def device_connect_info(rid: str, device=Depends(current_device)):
+    r = load_request(rid)
+    dev = get_doc("developers", r["developer_id"]) or {}
+    return {"request_id": rid, "app_name": dev.get("app_name", "App"), "status": r["status"]}
+
+
+@app.post("/v1/device/connect/{rid}/approve")
+def device_connect_approve(rid: str, tasks: BackgroundTasks, device=Depends(current_device)):
+    r = load_request(rid)
+    if r["status"] != "pending":
+        raise HTTPException(409, f"This request is {r['status']}")
+    developer_id = r["developer_id"]
+    existing = first("connections", developer_id=developer_id, device_id=device["id"])
+    if existing:
+        conn_id = existing["id"]
+    else:
+        conn_id = next_id("connections")
+        fs().collection("connections").document(str(conn_id)).set(
+            {"developer_id": developer_id, "device_id": device["id"], "created_at": now()}
+        )
+    fs().collection("connect_requests").document(rid).update(
+        {"status": "approved", "connection_id": conn_id, "device_id": device["id"]}
+    )
+    tasks.add_task(deliver_webhooks, developer_id, "connection.approved", {"connection_id": conn_id, "state": r.get("state")})
+    name = (get_doc("developers", developer_id) or {}).get("app_name", "App")
+    return {"connection_id": conn_id, "app_name": name}
+
+
+@app.post("/v1/device/connect/{rid}/deny")
+def device_connect_deny(rid: str, tasks: BackgroundTasks, device=Depends(current_device)):
+    r = load_request(rid)
+    if r["status"] != "pending":
+        raise HTTPException(409, f"This request is {r['status']}")
+    fs().collection("connect_requests").document(rid).update({"status": "denied", "device_id": device["id"]})
+    tasks.add_task(deliver_webhooks, r["developer_id"], "connection.denied", {"state": r.get("state")})
+    return {"status": "denied"}
+
+
+# ---------- dashboard ----------
+
+@app.get("/v1/events")
+def list_events(limit: int = 30, dev=Depends(current_developer)):
+    snaps = (
+        fs().collection("developers").document(str(dev["id"])).collection("events")
+        .order_by("ts", direction=Query.DESCENDING).limit(max(1, min(limit, 100))).stream()
+    )
+    return [s.to_dict() for s in snaps]
+
+
+@app.get("/dashboard", include_in_schema=False)
+def dashboard():
+    return FileResponse(Path(__file__).parent / "static" / "dashboard.html")
 
 
 @app.get("/")

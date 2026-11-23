@@ -17,7 +17,16 @@ and this stops anyone reading your data directly.
 4. Deploy. Open `https://<your-service>.onrender.com/` : it should show
    `"fcm": "live"` and `"database": "firestore"`.
 
-## 3. After switching from SQLite
+## 3. Your developer dashboard
+Open `https://<your-service>.onrender.com/dashboard` : create an API key, connect a phone with a link or
+QR code, send test alarms, add webhooks and watch events live, with copy-ready curl and JavaScript for
+every action.
+
+Optional environment variables:
+- `PUBLIC_BASE_URL` : your server's https address, if connect links ever show the wrong address.
+- `ANDROID_PACKAGE` / `ANDROID_SCHEME` : only if you rename the Android app (defaults `com.example.alarmapp` / `alarmapp`).
+
+## 4. After switching from SQLite
 The old data is not carried over. Phones register again by themselves (the app handles it and shows
 a new pair code), and developer API keys must be created again.
 
