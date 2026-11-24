@@ -44,6 +44,10 @@ pre{background:var(--bg);border-radius:12px;padding:12px;overflow:auto;font-size
 .err{color:var(--err)} .ok{color:var(--ok)}
 details{margin-top:14px;color:var(--dim);font-size:13px}
 summary{cursor:pointer}
+.cat{border-top:1px solid var(--line);padding:12px 0}
+.task{display:flex;align-items:center;gap:8px;padding:6px 0;margin:0;font-size:15px;color:var(--text)}
+.task input{width:auto}
+.done{text-decoration:line-through;color:var(--dim)}
 a{color:var(--amber)}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--high);padding:10px 18px;border-radius:999px;opacity:0;transition:.2s;pointer-events:none;z-index:9;max-width:90vw}
 #toast.show{opacity:1}
@@ -87,14 +91,23 @@ a{color:var(--amber)}
       <input id="alarm-label" class="grow" placeholder="Label (optional)" maxlength="80">
       <select id="snooze" style="width:auto"><option value="5">Snooze 5 min</option><option value="10" selected>Snooze 10 min</option><option value="15">Snooze 15 min</option></select>
     </div>
+    <label>Show a to-do category when it rings (optional)</label>
+    <div class="row"><select id="alarm-cat" class="grow"></select><select id="alarm-task" class="grow"></select></div>
     <label>Repeat (leave empty for a one-time alarm)</label>
     <div class="days" id="days"></div>
     <div class="row" style="margin-top:10px"><button id="btn-create-alarm">Create alarm</button></div>
     <div id="alarm-list" style="margin-top:14px"></div>
   </section>
 
+  <section class="card needs-key" id="s-todo">
+    <h2>4 · To-do lists</h2>
+    <p class="sub">Create categories and tasks on the phone. Link an alarm to a category and, when it rings, the phone shows every task in it, done and not done. Only the user ticks tasks off, never the alarm.</p>
+    <div class="row"><input id="cat-name" class="grow" placeholder="New category, e.g. Morning routine" maxlength="60"><button id="btn-cat">Add category</button></div>
+    <div id="todo-list" style="margin-top:14px"></div>
+  </section>
+
   <section class="card needs-key" id="s-hooks">
-    <h2>4 · Webhooks (optional)</h2>
+    <h2>5 · Webhooks (optional)</h2>
     <p class="sub">Get an HTTPS call when an alarm rings, is snoozed or dismissed. Tip: paste a free address from webhook.site to watch them arrive.</p>
     <div class="row"><input id="hook-url" class="grow" placeholder="https://webhook.site/your-id"><button id="btn-hook">Add webhook</button></div>
     <div id="hook-secret"></div>
@@ -130,6 +143,7 @@ let KEY = localStorage.getItem('alarm_api_key') || '';
 let ACTIVE = Number(localStorage.getItem('alarm_active_conn') || 0) || 0;
 let ME = null, connectTimer = null, lastCall = null;
 const days = new Set();
+let CATS = [], lastTodoHtml = '';
 
 function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2600); }
 function copy(text){ navigator.clipboard.writeText(text).then(() => toast('Copied'), () => toast('Copy failed')); }
@@ -283,7 +297,7 @@ async function loadAlarms(){
   try {
     const list = await api('GET', '/v1/alarms?connection_id=' + ACTIVE, undefined, {quiet: true});
     el.innerHTML = list.length ? list.map(a => `<div class="item"><div class="t">${esc(a.time)}</div>
-      <div class="m"><b>${esc(a.label || '(no label)')}</b><br>${esc(fmtDays(a.repeat_days))} · snooze ${a.snooze_minutes} min</div>
+      <div class="m"><b>${esc(a.label || '(no label)')}</b><br>${esc(fmtDays(a.repeat_days))} · snooze ${a.snooze_minutes} min${linkText(a)}</div>
       <button class="small" data-toggle="${a.id}" data-on="${a.enabled}">${a.enabled ? 'On' : 'Off'}</button>
       <button class="small danger" data-del="${a.id}">Delete</button></div>`).join('')
       : '<p class="sub">No alarms yet. Create one above.</p>';
@@ -293,12 +307,78 @@ async function loadAlarms(){
 }
 async function createAlarm(time, label){
   try {
-    await api('POST', '/v1/alarms', {connection_id: ACTIVE, time, repeat_days: [...days].sort(), label, snooze_minutes: Number($('#snooze').value)});
+    const body = {connection_id: ACTIVE, time, repeat_days: [...days].sort(), label, snooze_minutes: Number($('#snooze').value)};
+    if ($('#alarm-cat').value) body.category_id = Number($('#alarm-cat').value);
+    if ($('#alarm-task').value) body.task_id = Number($('#alarm-task').value);
+    await api('POST', '/v1/alarms', body);
     toast('Alarm sent to the phone'); await loadAlarms();
   } catch (e) { toast(e.message); }
 }
 async function toggleAlarm(id, on){ try { await api('PATCH', '/v1/alarms/' + id, {enabled: on}); await loadAlarms(); } catch (e) { toast(e.message); } }
 async function deleteAlarm(id){ try { await api('DELETE', '/v1/alarms/' + id); await loadAlarms(); } catch (e) { toast(e.message); } }
+
+/* ---------- to-do lists ---------- */
+function linkText(a){
+  if (!a.category_id) return '';
+  const c = CATS.find(x => x.id === a.category_id);
+  return ' · shows list “' + esc(c ? c.name : '#' + a.category_id) + '”';
+}
+function fillAlarmLinks(){
+  const cs = $('#alarm-cat'), ts = $('#alarm-task'), prev = cs.value;
+  cs.innerHTML = '<option value="">No to-do category</option>' + CATS.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  if (CATS.some(c => String(c.id) === prev)) cs.value = prev;
+  const cat = CATS.find(c => String(c.id) === cs.value), prevT = ts.value;
+  ts.innerHTML = '<option value="">Whole category</option>' + (cat ? cat.tasks.map(t => `<option value="${t.id}">${esc(t.title)}</option>`).join('') : '');
+  if (cat && cat.tasks.some(t => String(t.id) === prevT)) ts.value = prevT;
+  ts.disabled = !cat;
+}
+async function loadTodos(){
+  const el = $('#todo-list');
+  if (!ACTIVE) { CATS = []; lastTodoHtml = ''; el.innerHTML = ''; fillAlarmLinks(); return; }
+  try {
+    CATS = await api('GET', '/v1/categories?connection_id=' + ACTIVE, undefined, {quiet: true});
+    const html = CATS.length ? CATS.map(c => {
+      const done = c.tasks.filter(t => t.done).length;
+      return `<div class="cat"><div class="row"><b class="grow">${esc(c.name)}</b><span class="chip">${done} of ${c.tasks.length} done</span><button class="small danger" data-cdel="${c.id}">Delete</button></div>` +
+        c.tasks.map(t => `<label class="task"><input type="checkbox" data-tdone="${t.id}" ${t.done ? 'checked' : ''}><span class="${t.done ? 'done' : ''}">${esc(t.title)}</span><button class="small danger" data-tdel="${t.id}" style="margin-left:auto">×</button></label>`).join('') +
+        `<div class="row" style="margin-top:6px"><input class="grow" data-newtask="${c.id}" placeholder="Add a task" maxlength="200"><button class="small" data-addtask="${c.id}">Add</button></div></div>`;
+    }).join('') : '<p class="sub">No categories yet. Add one above.</p>';
+    const typing = [...el.querySelectorAll('[data-newtask]')].some(i => i.value);
+    if (html !== lastTodoHtml && !typing) { el.innerHTML = html; lastTodoHtml = html; }
+  } catch (e) { el.innerHTML = `<p class="err">${esc(e.message)}</p>`; lastTodoHtml = ''; }
+  fillAlarmLinks();
+}
+async function createCategory(){
+  const name = $('#cat-name').value.trim();
+  if (!name) return;
+  try { await api('POST', '/v1/categories', {connection_id: ACTIVE, name}); $('#cat-name').value = ''; loadTodos(); }
+  catch (e) { toast(e.message); }
+}
+$('#btn-cat').onclick = createCategory;
+$('#cat-name').onkeydown = e => { if (e.key === 'Enter') createCategory(); };
+$('#alarm-cat').onchange = fillAlarmLinks;
+$('#todo-list').addEventListener('click', async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try {
+    if (b.dataset.cdel) await api('DELETE', '/v1/categories/' + b.dataset.cdel);
+    else if (b.dataset.tdel) await api('DELETE', '/v1/tasks/' + b.dataset.tdel);
+    else if (b.dataset.addtask) {
+      const inp = document.querySelector('[data-newtask="' + b.dataset.addtask + '"]');
+      const title = inp.value.trim(); if (!title) return;
+      await api('POST', '/v1/tasks', {category_id: Number(b.dataset.addtask), title});
+      inp.value = '';
+    } else return;
+    loadTodos(); loadAlarms();
+  } catch (err) { toast(err.message); }
+});
+$('#todo-list').addEventListener('change', async e => {
+  const cb = e.target.closest('[data-tdone]'); if (!cb) return;
+  try { await api('PATCH', '/v1/tasks/' + cb.dataset.tdone, {done: cb.checked}); loadTodos(); } catch (err) { toast(err.message); }
+});
+$('#todo-list').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !e.target.dataset.newtask) return;
+  const btn = document.querySelector('[data-addtask="' + e.target.dataset.newtask + '"]'); if (btn) btn.click();
+});
 
 /* ---------- webhooks ---------- */
 async function loadHooks(){
@@ -345,7 +425,7 @@ async function boot(){
     }
   }
   renderAccount();
-  if (KEY) { await loadConnections(); await loadHooks(); await loadAlarms(); loadEvents(); }
+  if (KEY) { await loadConnections(); await loadHooks(); await loadTodos(); await loadAlarms(); loadEvents(); }
 }
 
 $('#days').innerHTML = DAYS.map((l, i) => `<button type="button" data-d="${i + 1}">${l}</button>`).join('');
@@ -361,10 +441,10 @@ $('#btn-pair').onclick = usePairCode;
 $('#btn-quick').onclick = () => createAlarm(inMinutes(2), 'Test alarm');
 $('#btn-create-alarm').onclick = () => createAlarm($('#alarm-time').value, $('#alarm-label').value.trim());
 $('#btn-hook').onclick = createHook;
-$('#conn-select').onchange = e => { ACTIVE = Number(e.target.value) || 0; localStorage.setItem('alarm_active_conn', ACTIVE); loadAlarms(); };
+$('#conn-select').onchange = e => { ACTIVE = Number(e.target.value) || 0; localStorage.setItem('alarm_active_conn', ACTIVE); loadTodos(); loadAlarms(); };
 document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => copy($('#' + b.dataset.copy).textContent));
 setInterval(() => { if (KEY) loadEvents(); }, 3000);
-setInterval(() => { if (KEY && ACTIVE) loadAlarms(); }, 6000);
+setInterval(() => { if (KEY && ACTIVE) { loadAlarms(); loadTodos(); } }, 5000);
 boot();
 </script>
 </body>

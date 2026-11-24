@@ -30,7 +30,7 @@ from google.cloud.firestore_v1 import Query
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Alarm API", version="0.3.0")
+app = FastAPI(title="Alarm API", version="0.4.0")
 
 # Authorization uses a header (no cookies), so allowing any origin is safe for browser testing.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -182,6 +182,8 @@ class AlarmIn(BaseModel):
     repeat_days: list[Day] = []
     label: str = Field("", max_length=80)
     snooze_minutes: int = Field(10, ge=1, le=60)
+    category_id: Optional[int] = Field(None, description="Show this to-do category when the alarm rings")
+    task_id: Optional[int] = Field(None, description="Highlight this task (must be in the category)")
 
 
 class AlarmPatch(BaseModel):
@@ -190,6 +192,8 @@ class AlarmPatch(BaseModel):
     label: Optional[str] = Field(None, max_length=80)
     snooze_minutes: Optional[int] = Field(None, ge=1, le=60)
     enabled: Optional[bool] = None
+    category_id: Optional[int] = None  # send null to unlink
+    task_id: Optional[int] = None
 
 
 class WebhookIn(BaseModel):
@@ -200,6 +204,30 @@ class WebhookIn(BaseModel):
 class DeviceEventIn(BaseModel):
     alarm_id: int
     type: str = Field(pattern=r"^(fired|snoozed|dismissed)$")
+
+
+class CategoryIn(BaseModel):
+    connection_id: int
+    name: str = Field(min_length=1, max_length=60)
+
+
+class CategoryPatch(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class TaskIn(BaseModel):
+    category_id: int
+    title: str = Field(min_length=1, max_length=200)
+    done: bool = False
+
+
+class TaskPatch(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    done: Optional[bool] = None
+
+
+class TaskDoneIn(BaseModel):
+    done: bool
 
 
 # ---------- helpers ----------
@@ -216,10 +244,28 @@ def alarm_out(alarm_id: int, a: dict, app_name: Optional[str] = None) -> dict:
         "label": a.get("label", ""),
         "snooze_minutes": a.get("snooze_minutes", 10),
         "enabled": bool(a.get("enabled", True)),
+        "category_id": a.get("category_id"),
+        "task_id": a.get("task_id"),
     }
     if app_name:
         out["source_app"] = app_name
     return out
+
+
+def resolve_todo_link(connection_id: int, category_id: Optional[int], task_id: Optional[int]):
+    """Checks that the category/task belong to this connection; a task implies its category."""
+    if task_id is not None:
+        task = get_doc("tasks", task_id)
+        if not task or task["connection_id"] != connection_id:
+            raise HTTPException(404, "Task not found on this connection")
+        if category_id is not None and category_id != task["category_id"]:
+            raise HTTPException(422, "task_id does not belong to category_id")
+        category_id = task["category_id"]
+    if category_id is not None:
+        cat = get_doc("categories", category_id)
+        if not cat or cat["connection_id"] != connection_id:
+            raise HTTPException(404, "Category not found on this connection")
+    return category_id, task_id
 
 
 def owned_connection(dev: dict, connection_id: int) -> dict:
@@ -312,6 +358,7 @@ def list_connections(dev=Depends(current_developer)):
 @app.post("/v1/alarms", status_code=201)
 def create_alarm(body: AlarmIn, dev=Depends(current_developer)):
     conn = owned_connection(dev, body.connection_id)
+    category_id, task_id = resolve_todo_link(body.connection_id, body.category_id, body.task_id)
     alarm_id = next_id("alarms")
     alarm = {
         "connection_id": body.connection_id,
@@ -319,6 +366,8 @@ def create_alarm(body: AlarmIn, dev=Depends(current_developer)):
         "repeat_days": sorted(set(body.repeat_days)),
         "label": body.label,
         "snooze_minutes": body.snooze_minutes,
+        "category_id": category_id,
+        "task_id": task_id,
         "enabled": True,
         "created_at": now(),
     }
@@ -340,7 +389,17 @@ def list_alarms(connection_id: int, dev=Depends(current_developer)):
 @app.patch("/v1/alarms/{alarm_id}")
 def update_alarm(alarm_id: int, body: AlarmPatch, dev=Depends(current_developer)):
     alarm, conn = owned_alarm(dev, alarm_id)
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_unset=True)
+    for key in ("time", "repeat_days", "label", "snooze_minutes", "enabled"):
+        if key in changes and changes[key] is None:
+            del changes[key]  # these can't be cleared
+    if "category_id" in changes or "task_id" in changes:
+        new_cat = changes["category_id"] if "category_id" in changes else alarm.get("category_id")
+        new_task = changes["task_id"] if "task_id" in changes else alarm.get("task_id")
+        if "category_id" in changes and "task_id" not in changes and new_cat != alarm.get("category_id"):
+            new_task = None  # the old task belongs to the old category
+        new_cat, new_task = resolve_todo_link(alarm["connection_id"], new_cat, new_task)
+        changes["category_id"], changes["task_id"] = new_cat, new_task
     if "repeat_days" in changes:
         changes["repeat_days"] = sorted(set(changes["repeat_days"]))
     if changes:
@@ -383,6 +442,155 @@ def delete_webhook(hook_id: int, dev=Depends(current_developer)):
     if not hook or hook["developer_id"] != dev["id"]:
         raise HTTPException(404, "Webhook not found")
     fs().collection("webhooks").document(str(hook_id)).delete()
+
+
+# ---------- to-do lists: categories and tasks ----------
+
+def category_out(category_id: int, c: dict, app_name: Optional[str] = None) -> dict:
+    out = {"id": category_id, "connection_id": c["connection_id"], "name": c["name"]}
+    if app_name:
+        out["source_app"] = app_name
+    return out
+
+
+def task_out(task_id: int, t: dict, app_name: Optional[str] = None) -> dict:
+    out = {
+        "id": task_id,
+        "category_id": t["category_id"],
+        "connection_id": t["connection_id"],
+        "title": t["title"],
+        "done": bool(t.get("done", False)),
+    }
+    if app_name:
+        out["source_app"] = app_name
+    return out
+
+
+def owned_category(dev: dict, category_id: int):
+    cat = get_doc("categories", category_id)
+    if not cat:
+        raise HTTPException(404, "Category not found")
+    try:
+        conn = owned_connection(dev, cat["connection_id"])
+    except HTTPException:
+        raise HTTPException(404, "Category not found")
+    return cat, conn
+
+
+def owned_task(dev: dict, task_id: int):
+    task = get_doc("tasks", task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    try:
+        conn = owned_connection(dev, task["connection_id"])
+    except HTTPException:
+        raise HTTPException(404, "Task not found")
+    return task, conn
+
+
+def unlink_alarms(dev: dict, conn: dict, field: str, value: int, clear_both: bool):
+    """Alarms that pointed at a deleted category/task stop pointing at it, and the phone is told."""
+    for snap in query("alarms", **{field: value}).stream():
+        changes = {"category_id": None, "task_id": None} if clear_both else {"task_id": None}
+        snap.reference.update(changes)
+        alarm = {**snap.to_dict(), **changes}
+        push(conn["fcm_token"], "alarm.upsert", alarm_out(int(snap.id), alarm, dev["app_name"]))
+
+
+@app.post("/v1/categories", status_code=201)
+def create_category(body: CategoryIn, dev=Depends(current_developer)):
+    """A category groups to-do tasks on the user's phone, e.g. 'Morning routine'."""
+    conn = owned_connection(dev, body.connection_id)
+    category_id = next_id("categories")
+    cat = {"connection_id": body.connection_id, "name": body.name.strip(), "created_at": now()}
+    fs().collection("categories").document(str(category_id)).set(cat)
+    out = category_out(category_id, cat, dev["app_name"])
+    push(conn["fcm_token"], "category.upsert", out)
+    return out
+
+
+@app.get("/v1/categories")
+def list_categories(connection_id: int, dev=Depends(current_developer)):
+    """Every category on a connection, each with its tasks (including which are done)."""
+    owned_connection(dev, connection_id)
+    tasks_by_cat: dict[int, list] = {}
+    for s in query("tasks", connection_id=connection_id).stream():
+        t = task_out(int(s.id), s.to_dict())
+        tasks_by_cat.setdefault(t["category_id"], []).append(t)
+    out = []
+    for s in query("categories", connection_id=connection_id).stream():
+        c = category_out(int(s.id), s.to_dict())
+        c["tasks"] = sorted(tasks_by_cat.get(c["id"], []), key=lambda t: t["id"])
+        out.append(c)
+    return sorted(out, key=lambda c: c["id"])
+
+
+@app.patch("/v1/categories/{category_id}")
+def update_category(category_id: int, body: CategoryPatch, dev=Depends(current_developer)):
+    cat, conn = owned_category(dev, category_id)
+    cat["name"] = body.name.strip()
+    fs().collection("categories").document(str(category_id)).update({"name": cat["name"]})
+    out = category_out(category_id, cat, dev["app_name"])
+    push(conn["fcm_token"], "category.upsert", out)
+    return out
+
+
+@app.delete("/v1/categories/{category_id}", status_code=204)
+def delete_category(category_id: int, dev=Depends(current_developer)):
+    _, conn = owned_category(dev, category_id)
+    batch = fs().batch()
+    for t in query("tasks", category_id=category_id).stream():
+        batch.delete(t.reference)
+    batch.delete(fs().collection("categories").document(str(category_id)))
+    batch.commit()
+    unlink_alarms(dev, conn, "category_id", category_id, clear_both=True)
+    push(conn["fcm_token"], "category.delete", {"id": category_id})
+
+
+@app.post("/v1/tasks", status_code=201)
+def create_task(body: TaskIn, dev=Depends(current_developer)):
+    cat, conn = owned_category(dev, body.category_id)
+    task_id = next_id("tasks")
+    task = {
+        "connection_id": cat["connection_id"],
+        "category_id": body.category_id,
+        "title": body.title.strip(),
+        "done": body.done,
+        "created_at": now(),
+    }
+    fs().collection("tasks").document(str(task_id)).set(task)
+    out = task_out(task_id, task, dev["app_name"])
+    push(conn["fcm_token"], "task.upsert", out)
+    return out
+
+
+@app.get("/v1/tasks")
+def list_tasks(category_id: int, dev=Depends(current_developer)):
+    owned_category(dev, category_id)
+    tasks = [task_out(int(s.id), s.to_dict()) for s in query("tasks", category_id=category_id).stream()]
+    return sorted(tasks, key=lambda t: t["id"])
+
+
+@app.patch("/v1/tasks/{task_id}")
+def update_task(task_id: int, body: TaskPatch, dev=Depends(current_developer)):
+    task, conn = owned_task(dev, task_id)
+    changes = body.model_dump(exclude_none=True)
+    if "title" in changes:
+        changes["title"] = changes["title"].strip()
+    if changes:
+        fs().collection("tasks").document(str(task_id)).update(changes)
+        task.update(changes)
+    out = task_out(task_id, task, dev["app_name"])
+    push(conn["fcm_token"], "task.upsert", out)
+    return out
+
+
+@app.delete("/v1/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int, dev=Depends(current_developer)):
+    _, conn = owned_task(dev, task_id)
+    fs().collection("tasks").document(str(task_id)).delete()
+    unlink_alarms(dev, conn, "task_id", task_id, clear_both=False)
+    push(conn["fcm_token"], "task.delete", {"id": task_id})
 
 
 # ---------- device (Android app) endpoints ----------
@@ -444,6 +652,10 @@ def revoke_connection(connection_id: int, device=Depends(current_device)):
     batch = fs().batch()
     for a in query("alarms", connection_id=connection_id).stream():
         batch.delete(a.reference)
+    for t in query("tasks", connection_id=connection_id).stream():
+        batch.delete(t.reference)
+    for c in query("categories", connection_id=connection_id).stream():
+        batch.delete(c.reference)
     batch.delete(fs().collection("connections").document(str(connection_id)))
     batch.commit()
 
@@ -659,6 +871,44 @@ def device_connect_deny(rid: str, tasks: BackgroundTasks, device=Depends(current
     fs().collection("connect_requests").document(rid).update({"status": "denied", "device_id": device["id"]})
     tasks.add_task(deliver_webhooks, r["developer_id"], "connection.denied", {"state": r.get("state")})
     return {"status": "denied"}
+
+
+@app.get("/v1/device/todos")
+def device_todos(device=Depends(current_device)):
+    """Full sync of every category and task that connected apps created on this phone."""
+    cats, tasks = [], []
+    names: dict[int, str] = {}
+    for c in query("connections", device_id=device["id"]).stream():
+        dev_id = c.to_dict()["developer_id"]
+        conn_id = int(c.id)
+        if dev_id not in names:
+            names[dev_id] = (get_doc("developers", dev_id) or {}).get("app_name", "App")
+        for s in query("categories", connection_id=conn_id).stream():
+            cats.append(category_out(int(s.id), s.to_dict(), names[dev_id]))
+        for s in query("tasks", connection_id=conn_id).stream():
+            tasks.append(task_out(int(s.id), s.to_dict(), names[dev_id]))
+    return {"categories": sorted(cats, key=lambda c: c["id"]), "tasks": sorted(tasks, key=lambda t: t["id"])}
+
+
+@app.post("/v1/device/tasks/{task_id}/done")
+def device_task_done(task_id: int, body: TaskDoneIn, tasks: BackgroundTasks, device=Depends(current_device)):
+    """The user ticked (or unticked) a task on the phone. Only the user does this, never an alarm ringing."""
+    task = get_doc("tasks", task_id)
+    conn = get_doc("connections", task["connection_id"]) if task else None
+    if not task or not conn or conn["device_id"] != device["id"]:
+        raise HTTPException(404, "Task not found")
+    fs().collection("tasks").document(str(task_id)).update({"done": body.done})
+    tasks.add_task(
+        deliver_webhooks, conn["developer_id"], "task.updated",
+        {
+            "task_id": task_id,
+            "category_id": task["category_id"],
+            "connection_id": task["connection_id"],
+            "title": task["title"],
+            "done": body.done,
+        },
+    )
+    return {"status": "ok"}
 
 
 # ---------- dashboard ----------
